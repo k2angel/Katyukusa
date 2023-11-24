@@ -1,0 +1,16 @@
+/.mypy_cache
+/.idea
+/.vscode
+/build
+/dist
+.log
+.txt
+accounts.json
+cui.py
+gui.py
+gui_.py
+logger.py
+main.spec
+markovtest.txt
+NR_spammer_gui.py
+raider_test.py
