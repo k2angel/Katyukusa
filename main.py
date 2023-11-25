@@ -8,6 +8,8 @@ import string
 import sys
 import threading
 import time
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed, wait)
 
 import socketio
 from PIL import Image
@@ -18,12 +20,7 @@ from rich.console import Console
 from ascii import *
 from markov import Markov
 
-# from rich.console import Console
-# from rich.table import Table
-
-
 # SocketIOテンプレ
-
 
 class SocketIOClient:
     # namespace設定用
@@ -61,6 +58,9 @@ class SocketIOClient:
         def on_changed_icon_name(self):
             pass
 
+        def on_change_status(self):
+            pass
+
         def on_called_ban(self):
             pass
 
@@ -81,16 +81,16 @@ class SocketIOClient:
         self.sid = data["sid"]
         self.character = data["character_name"]
         self.imgs = data["imgs"]
-        img_no = data["img_no"]
+        self.img_no = data["img_no"]
 
         if type(self.character) is dict:
             self.character = list(data["character_name"].values())
 
         if self.uname == "ゲスト":
-            #logger.debug(f"Logouted.")
+            self.uname = None
             pass
         elif data["cmd"] == "create_user":
-            logger_(f"{self.uname}[{self.uid}]", "created")
+            logger(f"{self.uname}[{self.uid}]", "created")
             account = {"uname": self.uname, "passwd": passwd, "uid": self.uid}
             json_data["accounts"].append(account)
             with open("./accounts.json", "w", encoding="utf-8") as f:
@@ -159,7 +159,8 @@ class SocketIOClient:
         #logger.debug(f"Joined room. RoomID: {rid}, Username: {self.uname}")
         self.ban = False
         self.rid = rid
-        logger_(f"{self.uname}@{self.uid}", "joined")
+        logger(f"{self.uname}@{self.uid}", "joined")
+        #print(f"{self.uname}@{self.uid}", file=sys.stderr)
         self.event_.set()
 
     def on_sended(self, data):
@@ -169,7 +170,7 @@ class SocketIOClient:
     # ルーム作成時
     def on_room_created(self, data):
         rid = data["room_id"]
-        logger_(self.uid, "created")
+        logger(self.uid, "created")
         self.event_.set()
 
     # ユーザーネーム被り時
@@ -183,8 +184,9 @@ class SocketIOClient:
         uname = data["uname"]
         self.imgs = data["imgs"]
         array_no = int(data["selected_array_no"])
-        img_no = self.imgs[array_no]
+        self.img_no = self.imgs[array_no]
         #logger.debug(f"Changed Photo. User: {uname}, Imgs: {self.imgs}, ImgNo: {img_no}")
+        logger(f"{self.uname}@{self.uid}", "changed")
         self.event_.set()
 
     # アイコン/キャラ名変更時
@@ -192,9 +194,12 @@ class SocketIOClient:
         self.character = list(data["character_name"].values())
         self.event_.set()
 
+    def on_change_status(self, data):
+        self.event_.set()
+
     # BAN
     def on_called_ban(self, data):
-        #logger.debug(f"YOUR BANNED! RoomID: {self.rid}")
+        logger(f"{self.uname}@{self.uid}", "banned")
         pass
 
     # namespaceクラスオーバーライド
@@ -210,16 +215,20 @@ class SocketIOClient:
         self.Namespace.on_duplicate_username = self.on_duplicate_username
         self.Namespace.on_changed_photo = self.on_changed_photo
         self.Namespace.on_changed_icon_name = self.on_changed_icon_name
+        self.Namespace.on_change_status = self.on_change_status
         self.Namespace.on_called_ban = self.on_called_ban
 
     # 初期化
     def __init__(self, namespace):
         self.rid = None
         self.sid = None
+        self.uid = None
+        self.bid = None
         self.uname = None
         self.passwd = None
         self.character = None
         self.imgs = None
+        self.img_no = None
 
         self.namespace_ = namespace
         self.sio_ = socketio.Client()
@@ -242,6 +251,7 @@ class SocketIOClient:
     # ログイン
     def emitLogin(self, data):
         self.passwd = data["passwd"]
+        self.bid = data["bid"]
         self.sio_.emit(
             "login", data, callback=(self.on_logined_common, self.on_login_failed)
         )
@@ -266,11 +276,13 @@ class SocketIOClient:
 
     # ルーム入室
     def emitJoin(self, data):
-        if data["room_id"] == 0:
+        if data["room_id"] == "0":
             self.sio_.emit("join", data)
+            logger(f"{self.uname}@{self.uid}", "left")
         else:
             self.sio_.emit("join", data, callback=self.on_got_page)
             self.event_.wait()
+        self.event_.clear()
 
 
     # メッセージ送信
@@ -310,23 +322,38 @@ class SocketIOClient:
         character = data["character_name"]
         print(f"Changed Character: {character}")
 
+    def emitChangeStatus(self, data):
+        self.sio_.emit("change_status", data, callback=self.on_change_status)
+        self.event_.wait()
+        logger(f"{self.uname}@{self.uid}", "status")
+        self.event_.clear()
+
     # メイン処理
     def run(self):
         self.connect()
-        # print(self.sio_.sid)
+        #print(self.sio_.sid)
         # p = threading.Thread(target=self.sio_.wait)
         # p.setDaemon(True)
         # p.start()
         self.event_.clear()
 
 def titlebar():
+    count = 600
     while True:
-        try:
-            ping_ = int(ping("netroom.co.jp", unit="ms"))
-        except Exception:
-            ping_ = 0
-        System.Title(f"KATYUKUSA v1.0 ｜ Accounts: [{len(accounts)}] ｜ Ping: [{ping_}ms] ｜ Proxy: [0]")
-        time.sleep(60)
+        global titlebar_kill
+        if titlebar_kill:
+            break
+        if count == 600:
+            try:
+                ping_ = int(ping("netroom.co.jp", unit="ms"))
+            except Exception:
+                ping_ = 0
+            System.Title(f"KATYUKUSA {version} ｜ Accounts: [{len(accounts)}] ｜ Ping: [{ping_}ms] ｜ Proxies: [0]")
+            count = 0
+            time.sleep(0.1)
+        else:
+            count = count+1
+            time.sleep(0.1)
 
 
 
@@ -370,8 +397,8 @@ def print_(mark, message):
 def input_(mark, message):
     return console.input(f"[yellow][[/yellow]{mark}[yellow]][/yellow] {message.replace('> ', '[yellow1]> [/yellow1]')}")
 
-def logger_(message, status):
-    if status == "failed" or status == "invalid":
+def logger(message, status):
+    if status == "failed" or status == "invalid" or status == "banned":
         status = f"[red1][{status.upper()}][/red1]"
         mark = "[yellow1][[/yellow1][red1]-[/red1][yellow1]][/yellow1]"
     else:
@@ -393,14 +420,12 @@ def randStr(key=10):
     return "".join(random.choices(string.ascii_letters + string.digits, k=key))
 
 def friendSpam(uid: str, accounts: list):
-    sio_client = SocketIOClient("/")
-    sio_client.run()
+    client = SocketIOClient("/")
+    client.run()
     for account in accounts:
-        if "ゆうや" not in account["uname"]:
-            continue
         bid = randStr()
         # ログインデータ送信
-        sio_client.emitLogin(
+        client.emitLogin(
             {
                 "uname": account["uname"],
                 "passwd": account["passwd"],
@@ -409,12 +434,12 @@ def friendSpam(uid: str, accounts: list):
                 "keep_login": "0",
             }
         )
-        if sio_client.uname != None:
+        if client.uname != None or client.uname == "ゲスト":
             try:
-                img_no = random.choice(sio_client.imgs)
+                img_no = random.choice(client.imgs)
             except Exception:
                 img_no = 0
-            sio_client.emitPrivateMessage(
+            client.emitPrivateMessage(
                 {
                     "selected_uid": uid,
                     "msg": "",
@@ -422,34 +447,126 @@ def friendSpam(uid: str, accounts: list):
                     "img_no": img_no,
                 }
             )
-            logger_(f"{sio_client.uname}@{sio_client.uid}", "sent")
-            sio_client.emitLogout({"bid": bid, "sid": sio_client.sid})
+            logger(f"{client.uname}@{client.uid}", "sent")
+            client.emitLogout({"bid": bid, "sid": client.sid})
         else:
             try:
                 account["uid"]
             except Exception:
-                logger_(f"{account['uname']}", "failed")
+                logger(f"{account['uname']}", "failed")
             else:
-                logger_(f"{account['uname']}[{account['uid']}]", "failed")
+                logger(f"{account['uname']}[{account['uid']}]", "failed")
+
+
+def login_(account):
+    global clients
+    client = SocketIOClient("/")
+    client.run()
+    bid = randStr()
+    client.emitLogin(
+        {
+            "uname": account["uname"],
+            "passwd": account["passwd"],
+            "bid": bid,
+            "sid": "",
+            "keep_login": "0",
+        }
+    )
+    if client.uname == None or client.uname == "ゲスト":
+        logger(f"{account['uname']}@{account['uid']}", "failed")
+    else:
+        logger(f"{client.uname}@{client.uid}", "logged")
+    clients.append(client)
+
+def logout(client: SocketIOClient):
+    global clients
+    uname = client.uname
+    uid = client.uid
+    client.emitLogout({"bid": client.bid, "sid": client.sid})
+    logger(f"{uname}@{uid}", "logged")
+    client.disconnect()
+    clients.remove(client)
+
+def extraStatus():
+    def changeStatus(client, randstr_list):
+        while True:
+            for randstr in randstr_list:
+                client.emitChangeStatus({"status": randstr, "room_id": "0"})
+    randstr_list = [randStr(15) for i in range(10)]
+    with ThreadPoolExecutor() as executor:
+        tasks = [executor.submit(changeStatus, client, randstr_list) for client in clients]
+        wait(tasks, return_when="ALL_COMPLETED")
+
+def join(client: SocketIOClient, rid):
+    #time.sleep(0.05)
+    client.emitJoin({"room_id": rid, "page": 0, "passwd": "", "answer": ""})
+
+def leave(client: SocketIOClient):
+    client.emitJoin({"roomd_id": "0", "page": 0, "passwd": "", "answer": ""})
+
+def join_(account: dict, rid: str):
+    client = SocketIOClient("/")
+    client.run()
+    bid = randStr()
+    client.emitLogin(
+        {
+            "uname": account["uname"],
+            "passwd": account["passwd"],
+            "bid": bid,
+            "sid": "",
+            "keep_login": "0"
+        }
+    )
+    if client.uname != None:
+        client.emitJoin({"room_id": rid, "page": 0, "passwd": "", "answer": ""})
+        logger(f"{client.uname}@{client.uid}", "joined")
+    else:
+        logger(f"{account['uname']}@{account['uid']}", "failed")
+
+def spam(client: SocketIOClient, message: str, count: int):
+    for message_ in prefix(message, count):
+        time.sleep(0.01)
+        if client.ban:
+            break
+        img_no = random.choice(client.imgs)
+        if client.character == "":
+            character = ""
+        else:
+            character = random.choice(client.character)
+        client.emitSend(
+            {
+                "comment": message_,
+                "type": "1",
+                "room_id": client.rid,
+                "img": "",
+                "img_no": img_no,
+                "character_name": character,
+            }
+        )
+        logger(f"{client.uname}@{client.uid}", "sent")
 
 if getattr(sys, 'frozen', False):
     # 実行ファイルからの実行時
     script_dir = sys._MEIPASS
 else:
     # スクリプトからの実行時
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-file_path = os.path.join(script_dir, "sample.csv")
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 with open("./accounts.json", "r", encoding="utf-8") as f:
     json_data = json.load(f)
 
 accounts = json_data["accounts"]
-#logger.debug(f"AccountNum: {len(accounts)}")
-
-console = Console()
+clients = list()
+console = Console(stderr=True)
+version = "v1.1"
+titlebar_ = threading.Thread(target=titlebar)
+titlebar_kill = False
+titlebar_.start()
+extrastatus = threading.Thread(target=extraStatus)
 
 if __name__ == "__main__":
-    titlebar_ = threading.Thread(target=titlebar, daemon=True)
-    titlebar_.start()
+    System.Clear()
+
     print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(banner), 1))
     # print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter("Author: k2angel"), 1))
 
@@ -459,14 +576,18 @@ if __name__ == "__main__":
     try:
         # SocketIOClientインスタンス実行
         sio_client.run()
-    except Exception:
+        pass
+    except Exception as e:
         print_("!", "Failed connect server!")
         input_("#", "Press ENTER to exit.")
+        titlebar_kill = True
         titlebar_.join()
         System.Clear()
         exit()
     else:
         print_("#", "Successfully connected server!")
+        sio_client.disconnect()
+        del sio_client
     input()
     System.Clear()
     while True:
@@ -480,31 +601,37 @@ if __name__ == "__main__":
             System.Clear()
             continue
         System.Clear()
+        #for client in clients:
+        #    try:
+        #        client.connect()
+        #    except Exception:
+        #        pass
         if mode == 1:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(login_banner), 1))
             if len(accounts) != 1:
-                mode_ = input_("?", "Choose account > ")
-                if mode_ == "y":
-                    account_list()
-                    i = int(input_("#", "> "))
-                    account = accounts[i]
+                accounts_ = list()
+                raid = input_("RAID", "> ")
+                if raid == "y":
+                    count = int(input_("ACCOUNT", "> "))
+                    for i in range(count):
+                        account = random.choice(accounts)
+                        accounts_.append(account)
                 else:
-                    account = random.choice(accounts)
-            bid = randStr()
-            # ログインデータ送信
-            sio_client.emitLogin(
-                {
-                    "uname": account["uname"],
-                    "passwd": account["passwd"],
-                    "bid": bid,
-                    "sid": "",
-                    "keep_login": "0",
-                }
-            )
-            if sio_client.uname == None:
-                logger_(f"{account['uname']}[{account['uid']}]", "failed")
-            else:
-                logger_(f"{sio_client.uname}{sio_client.uid}", "logged")
+                    mode_ = input_("?", "Choose account > ")
+                    if mode_ == "y":
+                        account_list()
+                        i = int(input_("#", "> "))
+                        accounts_.append(accounts[i])
+                    else:
+                        accounts_.append(random.choice(accounts))
+                with ThreadPoolExecutor() as executor:
+                    tasks = [executor.submit(login_, account) for account in accounts_]
+                    wait(tasks, return_when="ALL_COMPLETED")
+        elif mode == 2:
+            print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(logout_banner), 1))
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(logout, client) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
         elif mode == 3:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(generator_banner), 1))
             # アカウント作成
@@ -531,7 +658,7 @@ if __name__ == "__main__":
                         }
                     )
                     if sio_client.uname == None:
-                        logger_(f"{account['uname']}[{account['uid']}]", "failed")
+                        logger(f"{account['uname']}[{account['uid']}]", "failed")
                         continue
                     if mode_ == "y":
                         sio_client.emitChangeProfile(
@@ -549,17 +676,17 @@ if __name__ == "__main__":
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(icon_banner), 1))
             path = input_("IMAGE", "> ")
             img = img2b64(path)
-            sio_client.emitChangeProfile(
-                {
-                    "img": img,
-                    "info": "",
-                    "room_id": "0",
-                    "img_command": "change",
-                    "selected_my_icon": "0",
-                }
-            )
-            logger_(sio_client.uname, "added")
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(client.emitChangeProfile, {"img": img,"info": "","room_id": "0","img_command": "change","selected_my_icon": client.img_no}) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
+            #logger(sio_client.uname, "added")
         elif mode == 6:
+            print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(status_banner), 1))
+            status = input_("STATUS", "> ")
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(client.emitChangeStatus,{"status": status, "room_id": "0"}) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
+        elif mode == 7:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(health_banner), 1))
             total = len(accounts)
             valid = 0
@@ -581,12 +708,12 @@ if __name__ == "__main__":
                     with open("./accounts.json", "w", encoding="utf-8") as f:
                         json.dump(json_data, f, indent=4, ensure_ascii=False)
                     if "uid" in account:
-                        logger_(f"{account['uname']}[{account['uid']}]","invalid")
+                        logger(f"{account['uname']}[{account['uid']}]", "invalid")
                     else:
-                        logger_(f"{account['uname']}", "invalid")
+                        logger(f"{account['uname']}", "invalid")
                 else:
                     valid = valid + 1
-                    logger_(f"{sio_client.uname}@{sio_client.uid}","invalid")
+                    logger(f"{sio_client.uname}@{sio_client.uid}", "invalid")
                     sio_client.emitLogout({"bid": bid, "sid": sio_client.sid})
             else:
                 print("-" * 15)
@@ -597,17 +724,20 @@ if __name__ == "__main__":
                 json_data = json.load(f)
 
             accounts = json_data["accounts"]
-        elif mode == 7:
+        elif mode == 8:
             account_list()
         elif mode == 10:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(join_banner), 1))
             # ルーム入室
             rid = input_("ID", "> ")
-            sio_client.emitJoin({"room_id": rid, "page": 0, "passwd": "", "answer": ""})
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(join, client, rid) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
         elif mode == 11:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(leave_banner), 1))
-            sio_client.emitJoin({"room_id": 0, "page": 0, "passwd": "", "answer": ""})
-            logger_(f"{sio_client.uname}@{sio_client.uid}", "left")
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(join, client, "0") for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
         elif mode == 12:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(create_banner), 1))
 
@@ -637,79 +767,64 @@ if __name__ == "__main__":
             )
         elif mode == 20:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(message_banner), 1))
-            if sio_client.rid == None:
-                print_("!", "Not joined yet.")
-                continue
             # メッセージ送信
             message = input_("MESSAGE", "> ")
             # img = int(input("画像を送信するか(0: する, 1: しない)\n>"))
             count = int(input_("COUNT", "> "))
             # start = time.time()
             # tqdm(range(count), desc="Spam"):
-            for message_ in prefix(message, count):
-                time.sleep(0.01)
-                if sio_client.ban:
-                    break
-                img_no = random.choice(sio_client.imgs)
-                if sio_client.character == "":
-                    character = ""
-                else:
-                    character = random.choice(sio_client.character)
-                sio_client.emitSend(
-                    {
-                        "comment": message_,
-                        "type": "1",
-                        "room_id": sio_client.rid,
-                        "img": "",
-                        "img_no": img_no,
-                        "character_name": character,
-                    }
-                )
-                logger_(f"{sio_client.uname}@{sio_client.uid}", "sent")
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(spam, client, message, count) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
         elif mode == 22:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(friend_banner), 1))
             uid = input_("UID", "> ")
-            max_process = int(len(accounts) / 8)
-            for idx in range(0, len(accounts), max_process):
-                multiprocessing.Process(target=friendSpam, args=[uid, accounts[idx:idx + max_process]]).start()
+            max_process = int(len(accounts) / 30)
+            accounts_list = [accounts[idx:idx+max_process] for idx in range(0, len(accounts), max_process)]
+            with ProcessPoolExecutor() as executor:
+                tasks = [executor.submit(friendSpam, uid, accounts) for accounts in accounts_list]
+                wait(tasks, return_when="ALL_COMPLETED")
         elif mode == 30:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(friendlist_banner), 1))
             # フレンドリスト取得
             sio_client.emitFriendList()
         elif mode == 31:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(proxy_banner), 1))
-            print_("!", "Proxy is not deployment.")
-        elif mode == 32:
-            print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(test_banner), 1))
-            print_("#", "Get UID.")
-            for account in accounts:
-                if "uid" in account.keys():
-                    continue
-                bid = randStr()
-                sio_client.emitLogin(
-                    {
-                        "uname": account["uname"],
-                        "passwd": account["passwd"],
-                        "bid": bid,
-                        "sid": "",
-                        "keep_login": "0",
-                    }
-                )
-                if sio_client.uname == None:
-                    json_data["accounts"].remove(account)
-                    with open("./accounts.json", "w", encoding="utf-8") as f:
-                        json.dump(json_data, f, indent=4, ensure_ascii=False)
-                    logger_(f"{account['uname']}", "invalid")
-                else:
-                    logger_(f"{sio_client.uname}@{sio_client.uid}", "valid")
+            print_("!", "Proxy is not implementation.")
+        elif mode == 34:
+            print_("!", "ExtaraStatus is not implementation.")
+            """
+            if not extrastatus.is_alive():
+                extrastatus.start()
+            else:
+                extrastatus.join()"""
         elif mode == 33:
+            print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(test_banner), 1))
+            print_("#", "Raid test.")
+            rid = "95285"#input_("RID", "> ")
+            accounts_ = list()
+            for i in range(5):
+                account = random.choice(accounts)
+                accounts_.append(account)
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(login_, account) for account in accounts_]
+                wait(tasks, return_when="ALL_COMPLETED")
+            with ThreadPoolExecutor() as executor:
+                tasks = [executor.submit(join, client, rid) for client in clients]
+                wait(tasks, return_when="ALL_COMPLETED")
+
+            #for client in clients:
+            #    multiprocessing.Process(target=join, args=[client, "101212"])
+        elif mode == 34:
             print(Colorate.Vertical(Colors.yellow_to_red, Center.XCenter(exit_banner), 1))
             # 切断
-            sio_client.disconnect()
-            #titlebar_.join()
+            for client in clients:
+                client.disconnect()
+                clients.remove(client)
+            titlebar_kill = True
+            titlebar_.join()
             System.Clear()
             # 終了
-            exit()
-        sio_client.event_.clear()
+            sys.exit()
         input_("#", "Press ENTER to go back.")
         System.Clear()
